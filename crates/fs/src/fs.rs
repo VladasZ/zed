@@ -83,7 +83,7 @@ pub trait Fs: Send + Sync {
         latency: Duration,
     ) -> Pin<Box<dyn Send + Stream<Item = Vec<PathBuf>>>>;
 
-    fn open_repo(&self, abs_dot_git: &Path) -> Option<Arc<Mutex<dyn GitRepository>>>;
+    fn open_repo(&self, abs_dot_git: &Path) -> Option<Arc<dyn GitRepository>>;
     fn is_fake(&self) -> bool;
     async fn is_case_sensitive(&self) -> Result<bool>;
     #[cfg(any(test, feature = "test-support"))]
@@ -506,16 +506,13 @@ impl Fs for RealFs {
         })))
     }
 
-    fn open_repo(&self, dotgit_path: &Path) -> Option<Arc<Mutex<dyn GitRepository>>> {
-        LibGitRepository::open(dotgit_path)
-            .log_err()
-            .map::<Arc<Mutex<dyn GitRepository>>, _>(|libgit_repository| {
-                Arc::new(Mutex::new(RealGitRepository::new(
-                    libgit_repository,
-                    self.git_binary_path.clone(),
-                    self.git_hosting_provider_registry.clone(),
-                )))
-            })
+    fn open_repo(&self, dotgit_path: &Path) -> Option<Arc<dyn GitRepository>> {
+        let repo = LibGitRepository::open(dotgit_path).log_err()?;
+        Some(Arc::new(RealGitRepository::new(
+            repo,
+            self.git_binary_path.clone(),
+            self.git_hosting_provider_registry.clone(),
+        )))
     }
 
     fn is_fake(&self) -> bool {
@@ -1489,7 +1486,7 @@ impl Fs for FakeFs {
         }))
     }
 
-    fn open_repo(&self, abs_dot_git: &Path) -> Option<Arc<Mutex<dyn GitRepository>>> {
+    fn open_repo(&self, abs_dot_git: &Path) -> Option<Arc<dyn GitRepository>> {
         let state = self.state.lock();
         let entry = state.read_path(abs_dot_git).unwrap();
         let mut entry = entry.lock();

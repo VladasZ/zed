@@ -24,7 +24,7 @@ pub struct Branch {
     pub unix_timestamp: Option<i64>,
 }
 
-pub trait GitRepository: Send {
+pub trait GitRepository: Send + Sync {
     fn reload_index(&self);
 
     /// Loads a git repository entry's contents.
@@ -58,7 +58,7 @@ impl std::fmt::Debug for dyn GitRepository {
 }
 
 pub struct RealGitRepository {
-    pub repository: LibGitRepository,
+    pub repository: Mutex<LibGitRepository>,
     pub git_binary_path: PathBuf,
     hosting_provider_registry: Arc<GitHostingProviderRegistry>,
 }
@@ -70,7 +70,7 @@ impl RealGitRepository {
         hosting_provider_registry: Arc<GitHostingProviderRegistry>,
     ) -> Self {
         Self {
-            repository,
+            repository: Mutex::new(repository),
             git_binary_path: git_binary_path.unwrap_or_else(|| PathBuf::from("git")),
             hosting_provider_registry,
         }
@@ -79,7 +79,7 @@ impl RealGitRepository {
 
 impl GitRepository for RealGitRepository {
     fn reload_index(&self) {
-        if let Ok(mut index) = self.repository.index() {
+        if let Ok(mut index) = self.repository.lock().index() {
             _ = index.read(false);
         }
     }
@@ -101,7 +101,7 @@ impl GitRepository for RealGitRepository {
             Ok(Some(String::from_utf8(content)?))
         }
 
-        match logic(&self.repository, relative_file_path) {
+        match logic(&*self.repository.lock(), relative_file_path) {
             Ok(value) => return value,
             Err(err) => log::error!("Error loading head text: {:?}", err),
         }
@@ -109,31 +109,35 @@ impl GitRepository for RealGitRepository {
     }
 
     fn remote_url(&self, name: &str) -> Option<String> {
-        let remote = self.repository.find_remote(name).ok()?;
+        let repo = self.repository.lock();
+        let remote = repo.find_remote(name).ok()?;
         remote.url().map(|url| url.to_string())
     }
 
     fn branch_name(&self) -> Option<String> {
-        let head = self.repository.head().log_err()?;
+        let repo = self.repository.lock();
+        let head = repo.head().log_err()?;
         let branch = String::from_utf8_lossy(head.shorthand_bytes());
         Some(branch.to_string())
     }
 
     fn head_sha(&self) -> Option<String> {
-        let head = self.repository.head().ok()?;
-        head.target().map(|oid| oid.to_string())
+        Some(self.repository.lock().head().ok()?.target()?.to_string())
     }
 
     fn statuses(&self, path_prefix: &Path) -> Result<GitStatus> {
         let working_directory = self
             .repository
+            .lock()
             .workdir()
-            .context("failed to read git work directory")?;
-        GitStatus::new(&self.git_binary_path, working_directory, path_prefix)
+            .context("failed to read git work directory")?
+            .to_path_buf();
+        GitStatus::new(&self.git_binary_path, &working_directory, path_prefix)
     }
 
     fn branches(&self) -> Result<Vec<Branch>> {
-        let local_branches = self.repository.branches(Some(BranchType::Local))?;
+        let repo = self.repository.lock();
+        let local_branches = repo.branches(Some(BranchType::Local))?;
         let valid_branches = local_branches
             .filter_map(|branch| {
                 branch.ok().and_then(|(branch, _)| {
@@ -158,36 +162,40 @@ impl GitRepository for RealGitRepository {
     }
 
     fn change_branch(&self, name: &str) -> Result<()> {
-        let revision = self.repository.find_branch(name, BranchType::Local)?;
+        let repo = self.repository.lock();
+        let revision = repo.find_branch(name, BranchType::Local)?;
         let revision = revision.get();
         let as_tree = revision.peel_to_tree()?;
-        self.repository.checkout_tree(as_tree.as_object(), None)?;
-        self.repository.set_head(
+        repo.checkout_tree(as_tree.as_object(), None)?;
+        repo.set_head(
             revision
                 .name()
                 .ok_or_else(|| anyhow::anyhow!("Branch name could not be retrieved"))?,
         )?;
         Ok(())
     }
-    fn create_branch(&self, name: &str) -> Result<()> {
-        let current_commit = self.repository.head()?.peel_to_commit()?;
-        self.repository.branch(name, &current_commit, false)?;
 
+    fn create_branch(&self, name: &str) -> Result<()> {
+        let repo = self.repository.lock();
+        let current_commit = repo.head()?.peel_to_commit()?;
+        repo.branch(name, &current_commit, false)?;
         Ok(())
     }
 
     fn blame(&self, path: &Path, content: Rope) -> Result<crate::blame::Blame> {
         let working_directory = self
             .repository
+            .lock()
             .workdir()
-            .with_context(|| format!("failed to get git working directory for file {:?}", path))?;
+            .with_context(|| format!("failed to get git working directory for file {:?}", path))?
+            .to_path_buf();
 
         const REMOTE_NAME: &str = "origin";
         let remote_url = self.remote_url(REMOTE_NAME);
 
         crate::blame::Blame::for_path(
             &self.git_binary_path,
-            working_directory,
+            &working_directory,
             path,
             &content,
             remote_url,
@@ -210,8 +218,8 @@ pub struct FakeGitRepositoryState {
 }
 
 impl FakeGitRepository {
-    pub fn open(state: Arc<Mutex<FakeGitRepositoryState>>) -> Arc<Mutex<dyn GitRepository>> {
-        Arc::new(Mutex::new(FakeGitRepository { state }))
+    pub fn open(state: Arc<Mutex<FakeGitRepositoryState>>) -> Arc<dyn GitRepository> {
+        Arc::new(FakeGitRepository { state })
     }
 }
 
